@@ -1,0 +1,151 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release-macos:
+    name: Build, sign, notarize & release (macOS universal)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.11.0
+
+      - name: Install frontend dependencies
+        run: npm ci
+        working-directory: frontend
+
+      # ── Import Developer ID certificate from GitHub secret ──────────────────
+      - name: Import signing certificate
+        env:
+          CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_PASSWORD }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          echo "$CERTIFICATE_P12_BASE64" | base64 --decode -o "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      # ── Build universal binary (arm64 + amd64) ──────────────────────────────
+      - name: Build Wails app (universal)
+        run: |
+          wails build \
+            --platform darwin/universal \
+            --clean \
+            -ldflags "-s -w"
+
+      # ── Sign the .app ────────────────────────────────────────────────────────
+      - name: Sign .app
+        env:
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID_APPLICATION_IDENTITY }}
+        run: |
+          codesign --deep --force --options runtime \
+            --sign "$DEVELOPER_ID" \
+            --entitlements build/darwin/entitlements.plist \
+            build/bin/Traceroute.app
+
+      # ── Package as .dmg via hdiutil ─────────────────────────────────────────
+      - name: Create DMG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          DMG_NAME="Traceroute-${VERSION}-macOS-universal.dmg"
+          hdiutil create \
+            -volname "Traceroute" \
+            -srcfolder build/bin/Traceroute.app \
+            -ov -format UDZO \
+            "build/bin/${DMG_NAME}"
+          echo "DMG_NAME=${DMG_NAME}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      # ── Notarize the DMG ─────────────────────────────────────────────────────
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "build/bin/${DMG_NAME}" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          xcrun stapler staple "build/bin/${DMG_NAME}"
+
+      # ── Also produce a .tar.gz of the .app for Homebrew cask ────────────────
+      - name: Create tar.gz for Homebrew
+        run: |
+          TARBALL_NAME="Traceroute-${VERSION}-macOS-universal.tar.gz"
+          tar -czf "build/bin/${TARBALL_NAME}" \
+            -C build/bin Traceroute.app
+          echo "TARBALL_NAME=${TARBALL_NAME}" >> "$GITHUB_ENV"
+
+          SHA256=$(shasum -a 256 "build/bin/${TARBALL_NAME}" | awk '{print $1}')
+          echo "TARBALL_SHA256=${SHA256}" >> "$GITHUB_ENV"
+
+      # ── Publish GitHub Release ───────────────────────────────────────────────
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Traceroute ${{ env.VERSION }}"
+          body: |
+            ## Install via Homebrew
+
+            ```sh
+            brew tap NathanBhanji/tap
+            brew install --cask nathanbhanji/tap/traceroute
+            ```
+
+            Or download the DMG below and drag Traceroute.app to /Applications.
+          files: |
+            build/bin/${{ env.DMG_NAME }}
+            build/bin/${{ env.TARBALL_NAME }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      # ── Trigger Homebrew tap update ──────────────────────────────────────────
+      - name: Dispatch tap update
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          repository: NathanBhanji/homebrew-tap
+          event-type: new-release
+          client-payload: |
+            {
+              "version": "${{ env.VERSION }}",
+              "tarball_name": "${{ env.TARBALL_NAME }}",
+              "sha256": "${{ env.TARBALL_SHA256 }}",
+              "download_url": "https://github.com/NathanBhanji/traceroute/releases/download/${{ github.ref_name }}/${{ env.TARBALL_NAME }}"
+            }

@@ -1,0 +1,18 @@
+# Wails build output
+build/bin/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Go
+*.test
+*.out
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
