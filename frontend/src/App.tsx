@@ -29,7 +29,11 @@ declare global {
 type AppState = 'idle' | 'running' | 'done' | 'error' | 'maxhops';
 
 const App: Component = () => {
-  const [hops, setHops] = createSignal<HopData[]>([]);
+  // Keyed by TTL so out-of-order parallel arrivals merge correctly
+  const [hopMap, setHopMap] = createSignal<Map<number, HopData>>(new Map());
+  const hops = createMemo(() =>
+    [...hopMap().values()].sort((a, b) => a.ttl - b.ttl)
+  );
   const [state, setState] = createSignal<AppState>('idle');
   const [destination, setDestination] = createSignal('');
   const [errorMsg, setErrorMsg] = createSignal('');
@@ -70,7 +74,7 @@ const App: Component = () => {
 
   const handleStart = async (host: string) => {
     teardownListeners();
-    setHops([]);
+    setHopMap(new Map());
     setErrorMsg('');
     setMaxHopsHit(0);
     setHistoricalHops(null);
@@ -80,7 +84,8 @@ const App: Component = () => {
 
     if (window.runtime) {
       offHop = window.runtime.EventsOn('hop', (data: unknown) => {
-        setHops((prev) => [...prev, data as HopData]);
+        const hop = data as HopData;
+        setHopMap((prev) => new Map(prev).set(hop.ttl, hop));
       });
       offDone = window.runtime.EventsOn('traceroute:done', () => {
         setState('done');

@@ -1,22 +1,29 @@
 // Package traceroute runs the system traceroute binary and streams parsed hops.
 //
+// Parallel probing (PingPlotter-style): one traceroute process is launched per
+// TTL, all concurrently, each with -f N -m N so it probes exactly that one
+// hop and exits.  Results arrive out of order and are forwarded immediately to
+// the caller's hops channel.
+//
 // On macOS and Linux, /usr/sbin/traceroute (or /usr/bin/traceroute) already
 // carries the setuid-root bit set by the OS vendor, so no additional
 // privileges are required from the calling process.
-// On Windows, the equivalent is C:\Windows\System32\tracert.exe, which also
-// runs without elevation.
+// On Windows, tracert does not support -f/-m in a useful parallel way, so we
+// fall back to the classic sequential approach there.
 package traceroute
 
 import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
+	"net"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // Hop represents a single traceroute hop result.
@@ -24,7 +31,7 @@ type Hop struct {
 	TTL       int     `json:"ttl"`
 	IP        string  `json:"ip"`
 	Hostname  string  `json:"hostname"`
-	RTT       float64 `json:"rtt"` // milliseconds, median of probes
+	RTT       float64 `json:"rtt"` // milliseconds, first probe
 	Success   bool    `json:"success"`
 	IsFinal   bool    `json:"isFinal"`
 	IsTimeout bool    `json:"isTimeout"`
@@ -44,38 +51,194 @@ func DefaultOptions() *Options {
 	}
 }
 
-// Run executes the system traceroute binary, parsing its output line-by-line
-// and streaming Hop values to the hops channel. The channel is NOT closed by
-// this function — the caller is responsible for closing it after Run returns.
+// ErrMaxHopsReached is returned when the traceroute exhausts all hops without
+// reaching the destination.
+var ErrMaxHopsReached = fmt.Errorf("max hops reached")
+
+// Run executes parallel per-TTL traceroute probes on Unix, or a single
+// sequential traceroute on Windows.  Hops are sent to the hops channel as
+// they arrive; the channel is NOT closed by this function.
 func Run(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error {
 	if opts == nil {
 		opts = DefaultOptions()
 	}
 
-	binary, args, err := buildCommand(dest, opts)
+	if runtime.GOOS == "windows" {
+		return runSequential(ctx, dest, opts, hops)
+	}
+	return runParallel(ctx, dest, opts, hops)
+}
+
+// ── Parallel implementation (macOS / Linux) ──────────────────────────────────
+
+func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error {
+	binary, err := tracerouteBinary()
 	if err != nil {
 		return err
 	}
 
-	cmd := exec.CommandContext(ctx, binary, args...)
+	timeoutSecs := opts.TimeoutMs / 1000
+	if timeoutSecs < 1 {
+		timeoutSecs = 1
+	}
 
+	// Resolve all destination IPs so we can detect isFinal across goroutines,
+	// even when the DNS round-robins to a different address than traceroute hits.
+	destIPs := resolveIPs(dest)
+	destIP := resolveIP(dest) // single value for parseUnixLine compat
+
+	// results collects one hop per TTL slot; index 0 = TTL 1.
+	results := make([]Hop, opts.MaxHops)
+	// gotResult[i] is true once TTL i+1 has a result.
+	gotResult := make([]atomic.Bool, opts.MaxHops)
+
+	// emitted is a channel that goroutines write their TTL index into once
+	// they have a result, so the collector goroutine can forward in real time.
+	emitted := make(chan int, opts.MaxHops)
+
+	var wg sync.WaitGroup
+
+	for ttl := 1; ttl <= opts.MaxHops; ttl++ {
+		if ctx.Err() != nil {
+			break
+		}
+
+		wg.Add(1)
+		go func(ttl int) {
+			defer wg.Done()
+			idx := ttl - 1
+
+			args := []string{
+				"-f", strconv.Itoa(ttl),
+				"-m", strconv.Itoa(ttl),
+				"-q", "1",
+				"-w", strconv.Itoa(timeoutSecs),
+				"-n", // numeric — we do async rDNS ourselves
+				dest,
+			}
+			cmd := exec.CommandContext(ctx, binary, args...)
+			out, _ := cmd.Output()
+
+			var hop Hop
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if line == "" || strings.HasPrefix(line, "traceroute") {
+					continue
+				}
+				if h, ok := parseUnixLine(line, destIP); ok {
+					hop = h
+					break
+				}
+			}
+
+			// If we got nothing (context cancelled, binary error) emit a timeout.
+			if hop.TTL == 0 {
+				hop = Hop{TTL: ttl, Success: false, IsTimeout: true}
+			}
+
+			// Async reverse-DNS.
+			if hop.Success && hop.Hostname == "" && hop.IP != "" {
+				if names, err := net.LookupAddr(hop.IP); err == nil && len(names) > 0 {
+					hop.Hostname = strings.TrimSuffix(names[0], ".")
+				}
+			}
+
+			results[idx] = hop
+			gotResult[idx].Store(true)
+
+			select {
+			case emitted <- idx:
+			case <-ctx.Done():
+			}
+		}(ttl)
+	}
+
+	// Wait for all probes, then stream results in TTL order, stopping at the
+	// first hop that reached the destination.
+	// We must wait for all because the destination responds to every TTL >=
+	// its true hop count with the same source IP — only the lowest such TTL
+	// is the real final hop.
+	wg.Wait()
+	close(emitted)
+	// Drain the emitted channel (we don't need it anymore, wg is done).
+	for range emitted {
+	}
+
+	// Find the lowest TTL that hit any of the destination's IPs — true final hop.
+	trueFinalTTL := 0
+	for i := 0; i < opts.MaxHops; i++ {
+		if !gotResult[i].Load() {
+			continue
+		}
+		h := results[i]
+		if h.Success && (h.IsFinal || (len(destIPs) > 0 && destIPs[h.IP])) {
+			trueFinalTTL = h.TTL
+			break // index order = TTL order, so first match is lowest
+		}
+	}
+
+	// Correct isFinal flags and stream in TTL order up to trueFinalTTL.
+	for i := 0; i < opts.MaxHops; i++ {
+		if !gotResult[i].Load() {
+			continue
+		}
+		hop := results[i]
+		hop.IsFinal = (trueFinalTTL > 0 && hop.TTL == trueFinalTTL)
+
+		select {
+		case hops <- hop:
+		case <-ctx.Done():
+			return nil
+		}
+
+		if hop.IsFinal {
+			break
+		}
+	}
+
+	if ctx.Err() != nil {
+		return nil
+	}
+	if trueFinalTTL == 0 {
+		return ErrMaxHopsReached
+	}
+	return nil
+}
+
+// ── Sequential implementation (Windows / fallback) ───────────────────────────
+
+func runSequential(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error {
+	timeoutSecs := opts.TimeoutMs / 1000
+	if timeoutSecs < 1 {
+		timeoutSecs = 1
+	}
+
+	var binary string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		binary = "tracert"
+		args = []string{"-h", strconv.Itoa(opts.MaxHops), "-w", strconv.Itoa(opts.TimeoutMs), dest}
+	default:
+		b, err := tracerouteBinary()
+		if err != nil {
+			return err
+		}
+		binary = b
+		args = []string{"-m", strconv.Itoa(opts.MaxHops), "-w", strconv.Itoa(timeoutSecs), "-q", "1", dest}
+	}
+
+	cmd := exec.CommandContext(ctx, binary, args...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return fmt.Errorf("cannot create stdout pipe: %w", err)
+		return err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return fmt.Errorf("cannot create stderr pipe: %w", err)
-	}
-
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("cannot start %s: %w", binary, err)
+		return err
 	}
 
-	// Drain stderr (warnings from traceroute, e.g. "multiple addresses")
-	go io.Copy(io.Discard, stderr)
-
-	destIP := "" // filled once we parse the header line
+	destIP := resolveIP(dest)
 	reachedDest := false
 	lastTTL := 0
 
@@ -87,24 +250,21 @@ func Run(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error
 			return nil
 		default:
 		}
-
 		line := scanner.Text()
-		if line == "" {
+		if line == "" || strings.HasPrefix(strings.TrimSpace(line), "traceroute") || strings.HasPrefix(strings.TrimSpace(line), "Tracing") {
 			continue
 		}
-
-		// Header line: "traceroute to google.com (142.251.30.138), 30 hops max, 40 byte packets"
-		if strings.HasPrefix(line, "traceroute to ") || strings.HasPrefix(strings.TrimSpace(line), "Tracing") {
-			destIP = parseDestIP(line)
-			continue
+		var hop Hop
+		var ok bool
+		if runtime.GOOS == "windows" {
+			hop, ok = parseWindowsLine(line, destIP)
+		} else {
+			hop, ok = parseUnixLine(line, destIP)
 		}
-
-		hop, ok := parseLine(line, destIP)
 		if !ok {
 			continue
 		}
 		hops <- hop
-
 		if hop.TTL > lastTTL {
 			lastTTL = hop.TTL
 		}
@@ -113,7 +273,6 @@ func Run(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error
 			break
 		}
 	}
-
 	_ = cmd.Wait()
 
 	if !reachedDest && lastTTL >= opts.MaxHops {
@@ -122,199 +281,142 @@ func Run(ctx context.Context, dest string, opts *Options, hops chan<- Hop) error
 	return nil
 }
 
-// ErrMaxHopsReached is returned when the traceroute exhausts all hops without
-// reaching the destination.
-var ErrMaxHopsReached = fmt.Errorf("max hops reached")
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
-// buildCommand constructs the platform-appropriate command and arguments.
-func buildCommand(dest string, opts *Options) (string, []string, error) {
-	timeoutSecs := opts.TimeoutMs / 1000
-	if timeoutSecs < 1 {
-		timeoutSecs = 1
-	}
-
+func tracerouteBinary() (string, error) {
 	switch runtime.GOOS {
 	case "darwin":
-		// macOS traceroute flags:
-		//   -m <maxhops>   max TTL
-		//   -w <secs>      per-hop wait
-		//   -q 1           send only 1 probe per hop (cleaner output)
-		binary := "/usr/sbin/traceroute"
-		args := []string{
-			"-m", strconv.Itoa(opts.MaxHops),
-			"-w", strconv.Itoa(timeoutSecs),
-			"-q", "1",
-			dest,
-		}
-		return binary, args, nil
-
+		return "/usr/sbin/traceroute", nil
 	case "linux":
-		// Try traceroute, fall back to tracepath
-		binary := "/usr/bin/traceroute"
-		if _, err := exec.LookPath(binary); err != nil {
-			if alt, err2 := exec.LookPath("traceroute"); err2 == nil {
-				binary = alt
-			} else {
-				return "", nil, fmt.Errorf("traceroute binary not found; install inetutils-traceroute or traceroute")
+		for _, p := range []string{"/usr/bin/traceroute", "/usr/sbin/traceroute"} {
+			if _, err := exec.LookPath(p); err == nil {
+				return p, nil
 			}
 		}
-		args := []string{
-			"-m", strconv.Itoa(opts.MaxHops),
-			"-w", strconv.Itoa(timeoutSecs),
-			"-q", "1",
-			dest,
+		if p, err := exec.LookPath("traceroute"); err == nil {
+			return p, nil
 		}
-		return binary, args, nil
-
-	case "windows":
-		// Windows uses tracert; -h = max hops, -w = timeout in ms
-		args := []string{
-			"-h", strconv.Itoa(opts.MaxHops),
-			"-w", strconv.Itoa(opts.TimeoutMs),
-			dest,
-		}
-		return "tracert", args, nil
-
+		return "", fmt.Errorf("traceroute binary not found; install inetutils-traceroute or traceroute")
 	default:
-		return "", nil, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
+		return "", fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
 }
 
-// Header line patterns:
-// macOS/Linux: "traceroute to google.com (142.251.30.138), 30 hops max, 40 byte packets"
-// Windows:     "Tracing route to google.com [142.251.30.138]"
-var reDestIP = regexp.MustCompile(`[\(\[](\d+\.\d+\.\d+\.\d+)[\)\]]`)
-
-func parseDestIP(line string) string {
-	m := reDestIP.FindStringSubmatch(line)
-	if len(m) < 2 {
-		return ""
+// resolveIPs returns all IPv4 addresses for a host as a set.
+// If the host is already an IP, returns a set containing just that IP.
+func resolveIPs(host string) map[string]bool {
+	set := map[string]bool{}
+	if ip := net.ParseIP(host); ip != nil {
+		set[ip.String()] = true
+		return set
 	}
-	return m[1]
+	addrs, err := net.LookupHost(host)
+	if err != nil {
+		return set
+	}
+	for _, a := range addrs {
+		if ip := net.ParseIP(a); ip != nil && ip.To4() != nil {
+			set[a] = true
+		}
+	}
+	return set
 }
 
-// Hop line patterns (macOS/Linux with -q 1):
-//
-//	" 1  192.168.1.1 (192.168.1.1)  3.224 ms"
-//	" 1  router.local (192.168.1.1)  3.224 ms"
-//	" 2  *"
-//	" 2  * * *"
-//
-// Windows:
-//
-//	"  1    <1 ms    <1 ms    <1 ms  192.168.1.1"
-//	"  2     *        *        *     Request timed out."
-//
-// We handle all variants with a single flexible regex.
+// resolveIP returns the first IPv4 address for display / single-comparison use.
+func resolveIP(host string) string {
+	set := resolveIPs(host)
+	for ip := range set {
+		return ip
+	}
+	return host
+}
 
-// macOS/Linux hop line: TTL, then either timeout or host data.
-// Group 1: TTL
-// Group 2: hostname (optional)
-// Group 3: IP
-// Group 4: RTT value (first probe)
-var reUnixHop = regexp.MustCompile(`^\s*(\d+)\s+(?:(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)|(\d+\.\d+\.\d+\.\d+))\s+([\d.]+)\s+ms`)
+// ── Line parsers ──────────────────────────────────────────────────────────────
 
-// macOS/Linux timeout: " N  *" or " N  * * *"
+// With -n flag, output is always numeric, so hostname group won't appear.
+// Patterns we handle:
+//
+//	" 1  192.168.1.1  3.224 ms"          (numeric only, -n)
+//	" 1  host.example (1.2.3.4)  3 ms"   (with hostname, no -n)
+//	" 1  *"
+var reUnixHopNumeric = regexp.MustCompile(`^\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)\s+([\d.]+)\s+ms`)
+var reUnixHopNamed = regexp.MustCompile(`^\s*(\d+)\s+(\S+)\s+\((\d+\.\d+\.\d+\.\d+)\)\s+([\d.]+)\s+ms`)
 var reUnixTimeout = regexp.MustCompile(`^\s*(\d+)\s+\*`)
 
-// Windows hop: "  N  <1 ms  3 ms  4 ms  192.168.1.1"
-var reWinHop = regexp.MustCompile(`^\s*(\d+)\s+(?:<?\d+\s+ms\s+){1,3}\s*(\d+\.\d+\.\d+\.\d+|\S+)`)
-
-// Windows RTT extraction
-var reWinRTT = regexp.MustCompile(`(\d+)\s+ms`)
-
-// Windows timeout
-var reWinTimeout = regexp.MustCompile(`^\s*(\d+)\s+\*`)
-
-func parseLine(line, destIP string) (Hop, bool) {
-	if runtime.GOOS == "windows" {
-		return parseWindowsLine(line, destIP)
-	}
-	return parseUnixLine(line, destIP)
-}
-
 func parseUnixLine(line, destIP string) (Hop, bool) {
-	// Timeout line
+	// Timeout
 	if m := reUnixTimeout.FindStringSubmatch(line); m != nil {
-		// Only emit if it's truly a timeout line (contains * after TTL, no RTT)
-		if strings.Contains(line, "*") && !reUnixHop.MatchString(line) {
+		if strings.Contains(line, "*") && reUnixHopNumeric.FindString(line) == "" && reUnixHopNamed.FindString(line) == "" {
 			ttl, _ := strconv.Atoi(m[1])
 			return Hop{TTL: ttl, Success: false, IsTimeout: true}, true
 		}
 	}
 
-	// Successful hop line
-	m := reUnixHop.FindStringSubmatch(line)
-	if m == nil {
-		return Hop{}, false
+	// Numeric-only (with -n)
+	if m := reUnixHopNumeric.FindStringSubmatch(line); m != nil {
+		ttl, _ := strconv.Atoi(m[1])
+		ip := m[2]
+		rtt, _ := strconv.ParseFloat(m[3], 64)
+		return Hop{
+			TTL:     ttl,
+			IP:      ip,
+			RTT:     rtt,
+			Success: true,
+			IsFinal: destIP != "" && ip == destIP,
+		}, true
 	}
 
-	ttl, _ := strconv.Atoi(m[1])
-	hostname := m[2]
-	ip := m[3]
-	rttStr := m[5]
-
-	// When there's no hostname, the IP is in group 4
-	if ip == "" {
-		ip = m[4]
+	// Named (hostname + IP)
+	if m := reUnixHopNamed.FindStringSubmatch(line); m != nil {
+		ttl, _ := strconv.Atoi(m[1])
+		hostname := m[2]
+		ip := m[3]
+		rtt, _ := strconv.ParseFloat(m[4], 64)
+		return Hop{
+			TTL:      ttl,
+			IP:       ip,
+			Hostname: hostname,
+			RTT:      rtt,
+			Success:  true,
+			IsFinal:  destIP != "" && ip == destIP,
+		}, true
 	}
 
-	rtt, _ := strconv.ParseFloat(rttStr, 64)
-
-	isFinal := (destIP != "" && ip == destIP)
-
-	return Hop{
-		TTL:       ttl,
-		IP:        ip,
-		Hostname:  hostname,
-		RTT:       rtt,
-		Success:   true,
-		IsFinal:   isFinal,
-		IsTimeout: false,
-	}, true
+	return Hop{}, false
 }
 
+var reWinHop = regexp.MustCompile(`^\s*(\d+)\s+(?:<?\d+\s+ms\s+){1,3}\s*(\S+)`)
+var reWinRTT = regexp.MustCompile(`(\d+)\s+ms`)
+var reWinTimeout = regexp.MustCompile(`^\s*(\d+)\s+\*`)
+
 func parseWindowsLine(line, destIP string) (Hop, bool) {
-	// Windows timeout: "  N  *        *        *     Request timed out."
 	if reWinTimeout.MatchString(line) && strings.Contains(line, "*") {
 		m := reWinTimeout.FindStringSubmatch(line)
 		ttl, _ := strconv.Atoi(m[1])
 		return Hop{TTL: ttl, Success: false, IsTimeout: true}, true
 	}
-
 	m := reWinHop.FindStringSubmatch(line)
 	if m == nil {
 		return Hop{}, false
 	}
-
 	ttl, _ := strconv.Atoi(m[1])
 	host := strings.TrimSpace(m[2])
-
-	// Extract RTTs
 	rtts := reWinRTT.FindAllStringSubmatch(line, -1)
 	var rtt float64
 	if len(rtts) > 0 {
-		// Use the first RTT value
 		rtt, _ = strconv.ParseFloat(rtts[0][1], 64)
 	}
-
-	ip := host
-	hostname := ""
-	// Windows may show hostname [IP]
+	ip, hostname := host, ""
 	if idx := strings.Index(host, " ["); idx != -1 {
 		hostname = host[:idx]
 		ip = strings.Trim(host[idx+2:], "]")
 	}
-
-	isFinal := (destIP != "" && (ip == destIP || host == destIP))
-
 	return Hop{
-		TTL:       ttl,
-		IP:        ip,
-		Hostname:  hostname,
-		RTT:       rtt,
-		Success:   true,
-		IsFinal:   isFinal,
-		IsTimeout: false,
+		TTL:      ttl,
+		IP:       ip,
+		Hostname: hostname,
+		RTT:      rtt,
+		Success:  true,
+		IsFinal:  destIP != "" && (ip == destIP || host == destIP),
 	}, true
 }
