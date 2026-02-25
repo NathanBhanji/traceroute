@@ -71,22 +71,22 @@ func (a *App) StartTraceroute(host string, maxHops int, timeoutMs int) {
 	}
 
 	hopChan := make(chan traceroute.Hop, 64)
+	// errChan carries the Run result into the drain goroutine so saving and
+	// terminal event emission happen only after collected is fully populated.
+	errChan := make(chan error, 1)
 
-	// Collect hops for DB storage while also streaming to frontend
-	var collected []traceroute.Hop
+	// Drain goroutine: streams hops to frontend, saves to DB, then fires the
+	// terminal event. This is the single owner of `collected` — no race.
 	go func() {
+		var collected []traceroute.Hop
 		for hop := range hopChan {
 			collected = append(collected, hop)
 			runtime.EventsEmit(a.ctx, "hop", hop)
 		}
-		runtime.EventsEmit(a.ctx, "traceroute:done", nil)
-	}()
 
-	go func() {
-		err := traceroute.Run(ctx, host, opts, hopChan)
-		close(hopChan)
+		// hopChan is closed; collected is now complete. Save before notifying UI.
+		runErr := <-errChan
 
-		// Save to DB (even partial results are worth keeping)
 		if a.db != nil && len(collected) > 0 {
 			dbHops := make([]db.HopRecord, len(collected))
 			for i, h := range collected {
@@ -106,11 +106,21 @@ func (a *App) StartTraceroute(host string, maxHops int, timeoutMs int) {
 			}
 		}
 
-		if err == traceroute.ErrMaxHopsReached {
+		switch runErr {
+		case traceroute.ErrMaxHopsReached:
 			runtime.EventsEmit(a.ctx, "traceroute:maxhops", maxHops)
-		} else if err != nil {
-			runtime.EventsEmit(a.ctx, "traceroute:error", err.Error())
+		case nil:
+			runtime.EventsEmit(a.ctx, "traceroute:done", nil)
+		default:
+			runtime.EventsEmit(a.ctx, "traceroute:error", runErr.Error())
 		}
+	}()
+
+	// Run goroutine: executes the trace, closes hopChan, then sends the error.
+	go func() {
+		err := traceroute.Run(ctx, host, opts, hopChan)
+		close(hopChan)
+		errChan <- err
 	}()
 }
 
