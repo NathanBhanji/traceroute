@@ -113,27 +113,41 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          # Submit and wait — timeout after 10 minutes; print log on failure
+          # Submit (no --wait) and capture the submission ID
           SUBMISSION=$(xcrun notarytool submit "build/bin/${DMG_NAME}" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait \
-            --timeout 10m \
             --output-format json)
-
           echo "$SUBMISSION"
-          STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
-          ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+          ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "Submission ID: $ID"
 
-          if [ "$STATUS" != "Accepted" ]; then
-            echo "Notarization failed with status: $STATUS"
-            xcrun notarytool log "$ID" \
+          # Poll until Accepted/Invalid/timeout (45 min)
+          DEADLINE=$(( $(date +%s) + 2700 ))
+          while true; do
+            sleep 30
+            INFO=$(xcrun notarytool info "$ID" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_APP_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" || true
-            exit 1
-          fi
+              --team-id "$APPLE_TEAM_ID" \
+              --output-format json)
+            STATUS=$(echo "$INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+            echo "Status: $STATUS"
+            if [ "$STATUS" = "Accepted" ]; then
+              break
+            elif [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+              echo "Notarization failed: $STATUS"
+              xcrun notarytool log "$ID" \
+                --apple-id "$APPLE_ID" \
+                --password "$APPLE_APP_PASSWORD" \
+                --team-id "$APPLE_TEAM_ID" || true
+              exit 1
+            elif [ $(date +%s) -gt $DEADLINE ]; then
+              echo "Timed out waiting for notarization after 45 minutes"
+              exit 1
+            fi
+          done
 
           xcrun stapler staple "build/bin/${DMG_NAME}"
 
