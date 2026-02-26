@@ -67,14 +67,31 @@ jobs:
             -ldflags "-s -w"
 
       # ── Sign the .app ────────────────────────────────────────────────────────
+      # Sign inner binaries first, then the .app bundle itself.
+      # --deep is intentionally avoided: Apple's notarization rejects it.
       - name: Sign .app
         env:
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID_APPLICATION_IDENTITY }}
         run: |
-          codesign --deep --force --options runtime \
+          APP="build/bin/Traceroute.app"
+
+          # Sign every Mach-O binary inside the bundle individually
+          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +0111 \) | while read f; do
+            codesign --force --options runtime \
+              --sign "$DEVELOPER_ID" \
+              --entitlements build/darwin/entitlements.plist \
+              "$f"
+          done
+
+          # Sign the bundle itself
+          codesign --force --options runtime \
             --sign "$DEVELOPER_ID" \
             --entitlements build/darwin/entitlements.plist \
-            build/bin/Traceroute.app
+            "$APP"
+
+          # Verify
+          codesign --verify --deep --strict "$APP"
+          spctl --assess --type execute "$APP" || true
 
       # ── Package as .dmg via hdiutil ─────────────────────────────────────────
       - name: Create DMG
@@ -96,11 +113,27 @@ jobs:
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          xcrun notarytool submit "build/bin/${DMG_NAME}" \
+          # Submit and wait — timeout after 10 minutes; print log on failure
+          SUBMISSION=$(xcrun notarytool submit "build/bin/${DMG_NAME}" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
-            --wait
+            --wait \
+            --timeout 10m \
+            --output-format json)
+
+          echo "$SUBMISSION"
+          STATUS=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+          ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))")
+
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "Notarization failed with status: $STATUS"
+            xcrun notarytool log "$ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
 
           xcrun stapler staple "build/bin/${DMG_NAME}"
 
