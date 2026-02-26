@@ -41,7 +41,7 @@ const App: Component = () => {
   const [showHistory, setShowHistory] = createSignal(false);
   const [showOptions, setShowOptions] = createSignal(false);
   const [maxHops, setMaxHops] = createSignal(30);
-  const [timeoutMs, setTimeoutMs] = createSignal(3000);
+  const [timeoutMs, setTimeoutMs] = createSignal(1000);
   const [savedTraceId, setSavedTraceId] = createSignal(0);
   const [pendingHost, setPendingHost] = createSignal('');
 
@@ -85,7 +85,17 @@ const App: Component = () => {
     if (window.runtime) {
       offHop = window.runtime.EventsOn('hop', (data: unknown) => {
         const hop = data as HopData;
-        setHopMap((prev) => new Map(prev).set(hop.ttl, hop));
+        setHopMap((prev) => {
+          const next = new Map(prev).set(hop.ttl, hop);
+          // If this is the final hop, remove any stray hops beyond it
+          // (can happen in the rare race where a higher TTL arrived first)
+          if (hop.isFinal) {
+            for (const ttl of next.keys()) {
+              if (ttl > hop.ttl) next.delete(ttl);
+            }
+          }
+          return next;
+        });
       });
       offDone = window.runtime.EventsOn('traceroute:done', () => {
         setState('done');
@@ -245,7 +255,7 @@ const App: Component = () => {
                   max="10000"
                   step="500"
                   value={timeoutMs()}
-                  onInput={(e) => setTimeoutMs(parseInt(e.currentTarget.value) || 3000)}
+                  onInput={(e) => setTimeoutMs(parseInt(e.currentTarget.value) || 1000)}
                   class="w-20 h-7 px-2 rounded-lg border border-surface-200 text-sm font-mono text-center bg-white focus:outline-none focus:border-accent text-ink"
                 />
                 <span class="text-xs text-ink-tertiary">ms</span>

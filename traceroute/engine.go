@@ -47,7 +47,7 @@ type Options struct {
 func DefaultOptions() *Options {
 	return &Options{
 		MaxHops:   30,
-		TimeoutMs: 3000,
+		TimeoutMs: 1000,
 	}
 }
 
@@ -82,19 +82,15 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 		timeoutSecs = 1
 	}
 
-	// Resolve all destination IPs so we can detect isFinal across goroutines,
-	// even when the DNS round-robins to a different address than traceroute hits.
 	destIPs := resolveIPs(dest)
-	destIP := resolveIP(dest) // single value for parseUnixLine compat
+	destIP := resolveIP(dest)
 
-	// results collects one hop per TTL slot; index 0 = TTL 1.
-	results := make([]Hop, opts.MaxHops)
-	// gotResult[i] is true once TTL i+1 has a result.
-	gotResult := make([]atomic.Bool, opts.MaxHops)
-
-	// emitted is a channel that goroutines write their TTL index into once
-	// they have a result, so the collector goroutine can forward in real time.
-	emitted := make(chan int, opts.MaxHops)
+	// lowestFinalTTL: once any goroutine confirms the destination, this is set
+	// to the lowest TTL that reached it. Goroutines with a higher TTL discard
+	// their result rather than emitting it.
+	// Use MaxHops+1 as "not yet known".
+	var lowestFinalTTL atomic.Int32
+	lowestFinalTTL.Store(int32(opts.MaxHops + 1))
 
 	var wg sync.WaitGroup
 
@@ -106,14 +102,13 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 		wg.Add(1)
 		go func(ttl int) {
 			defer wg.Done()
-			idx := ttl - 1
 
 			args := []string{
 				"-f", strconv.Itoa(ttl),
 				"-m", strconv.Itoa(ttl),
 				"-q", "1",
 				"-w", strconv.Itoa(timeoutSecs),
-				"-n", // numeric — we do async rDNS ourselves
+				"-n",
 				dest,
 			}
 			cmd := exec.CommandContext(ctx, binary, args...)
@@ -131,9 +126,26 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 				}
 			}
 
-			// If we got nothing (context cancelled, binary error) emit a timeout.
 			if hop.TTL == 0 {
 				hop = Hop{TTL: ttl, Success: false, IsTimeout: true}
+			}
+
+			// If this hop reached the destination, try to record the lowest TTL.
+			if hop.Success && (hop.IsFinal || destIPs[hop.IP]) {
+				for {
+					cur := lowestFinalTTL.Load()
+					if int32(ttl) >= cur {
+						break // another goroutine already has a lower or equal TTL
+					}
+					if lowestFinalTTL.CompareAndSwap(cur, int32(ttl)) {
+						break
+					}
+				}
+			}
+
+			// Discard if a lower TTL already claimed the destination.
+			if int32(ttl) > lowestFinalTTL.Load() {
+				return
 			}
 
 			// Async reverse-DNS.
@@ -143,63 +155,22 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 				}
 			}
 
-			results[idx] = hop
-			gotResult[idx].Store(true)
+			// Set isFinal correctly: only true for the confirmed lowest TTL.
+			hop.IsFinal = (int32(ttl) == lowestFinalTTL.Load() && hop.Success && (hop.IsFinal || destIPs[hop.IP]))
 
 			select {
-			case emitted <- idx:
+			case hops <- hop:
 			case <-ctx.Done():
 			}
 		}(ttl)
 	}
 
-	// Wait for all probes, then stream results in TTL order, stopping at the
-	// first hop that reached the destination.
-	// We must wait for all because the destination responds to every TTL >=
-	// its true hop count with the same source IP — only the lowest such TTL
-	// is the real final hop.
 	wg.Wait()
-	close(emitted)
-	// Drain the emitted channel (we don't need it anymore, wg is done).
-	for range emitted {
-	}
-
-	// Find the lowest TTL that hit any of the destination's IPs — true final hop.
-	trueFinalTTL := 0
-	for i := 0; i < opts.MaxHops; i++ {
-		if !gotResult[i].Load() {
-			continue
-		}
-		h := results[i]
-		if h.Success && (h.IsFinal || (len(destIPs) > 0 && destIPs[h.IP])) {
-			trueFinalTTL = h.TTL
-			break // index order = TTL order, so first match is lowest
-		}
-	}
-
-	// Correct isFinal flags and stream in TTL order up to trueFinalTTL.
-	for i := 0; i < opts.MaxHops; i++ {
-		if !gotResult[i].Load() {
-			continue
-		}
-		hop := results[i]
-		hop.IsFinal = (trueFinalTTL > 0 && hop.TTL == trueFinalTTL)
-
-		select {
-		case hops <- hop:
-		case <-ctx.Done():
-			return nil
-		}
-
-		if hop.IsFinal {
-			break
-		}
-	}
 
 	if ctx.Err() != nil {
 		return nil
 	}
-	if trueFinalTTL == 0 {
+	if lowestFinalTTL.Load() > int32(opts.MaxHops) {
 		return ErrMaxHopsReached
 	}
 	return nil
