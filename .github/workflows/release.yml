@@ -75,23 +75,32 @@ jobs:
         run: |
           APP="build/bin/Traceroute.app"
 
-          # Sign every Mach-O binary inside the bundle individually
-          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" -o -perm +0111 \) | while read f; do
+          # Sign nested .app bundles first (inside-out), then loose binaries,
+          # then the outer bundle. This is the correct order for notarization.
+
+          # 1. Sign nested .app bundles (e.g. WebKit helpers) inside-out
+          find "$APP" -name "*.app" -mindepth 1 | sort -r | while read nested; do
             codesign --force --options runtime \
               --sign "$DEVELOPER_ID" \
               --entitlements build/darwin/entitlements.plist \
+              "$nested"
+          done
+
+          # 2. Sign loose dylibs and executables not inside a nested .app
+          find "$APP" -type f \( -name "*.dylib" -o -name "*.so" \) | while read f; do
+            codesign --force --options runtime \
+              --sign "$DEVELOPER_ID" \
               "$f"
           done
 
-          # Sign the bundle itself
+          # 3. Sign the outer bundle
           codesign --force --options runtime \
             --sign "$DEVELOPER_ID" \
             --entitlements build/darwin/entitlements.plist \
             "$APP"
 
           # Verify
-          codesign --verify --deep --strict "$APP"
-          spctl --assess --type execute "$APP" || true
+          codesign --verify --deep --strict --verbose=2 "$APP"
 
       # ── Package as .dmg via hdiutil ─────────────────────────────────────────
       - name: Create DMG
