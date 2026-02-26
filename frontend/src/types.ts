@@ -6,6 +6,7 @@ export interface HopData {
   success: boolean;
   isFinal: boolean;
   isTimeout: boolean;
+  isPending?: boolean; // true = result not yet arrived, show skeleton
 }
 
 export interface TraceRecord {

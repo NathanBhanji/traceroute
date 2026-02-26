@@ -1,5 +1,5 @@
 import type { Component } from 'solid-js';
-import { Show } from 'solid-js';
+import { Show, Switch, Match } from 'solid-js';
 import type { HopData } from '../types';
 
 interface HopRowProps {
@@ -41,56 +41,62 @@ const HopRow: Component<HopRowProps> = (props) => {
 
       {/* Host / IP */}
       <div class="min-w-0 pr-6">
-        <Show
-          when={props.hop.success}
-          fallback={<span class="font-mono text-sm text-ink-disabled">*</span>}
-        >
-          <Show when={props.hop.hostname && props.hop.hostname !== props.hop.ip}>
-            <div class="text-sm font-medium text-ink truncate" title={props.hop.hostname}>
-              {props.hop.hostname}
-            </div>
-            <div class="font-mono text-xs text-ink-tertiary mt-0.5 select-all">{props.hop.ip}</div>
-          </Show>
-          <Show when={!props.hop.hostname || props.hop.hostname === props.hop.ip}>
-            <div class="font-mono text-sm font-medium text-ink select-all">{props.hop.ip}</div>
-          </Show>
-        </Show>
+        <Switch>
+          <Match when={props.hop.isPending}>
+            <div class="skeleton h-3 w-36 rounded" />
+          </Match>
+          <Match when={props.hop.success}>
+            <Show when={props.hop.hostname && props.hop.hostname !== props.hop.ip}>
+              <div class="text-sm font-medium text-ink truncate" title={props.hop.hostname}>
+                {props.hop.hostname}
+              </div>
+              <div class="font-mono text-xs text-ink-tertiary mt-0.5 select-all">{props.hop.ip}</div>
+            </Show>
+            <Show when={!props.hop.hostname || props.hop.hostname === props.hop.ip}>
+              <div class="font-mono text-sm font-medium text-ink select-all">{props.hop.ip}</div>
+            </Show>
+          </Match>
+          <Match when={!props.hop.success}>
+            <span class="font-mono text-sm text-ink-disabled">*</span>
+          </Match>
+        </Switch>
       </div>
 
       {/* Waterfall bar */}
       <div class="pr-5">
-        <Show
-          when={props.hop.success}
-          fallback={
-            /* timeout — show a faint dashed line */
+        <Switch>
+          <Match when={props.hop.isPending}>
+            <div class="skeleton h-[6px] w-1/3 rounded-full" />
+          </Match>
+          <Match when={props.hop.success}>
+            <div class="relative w-full h-[6px] rounded-full overflow-hidden" style={{ background: '#f0f0ef' }}>
+              <div
+                class="absolute left-0 top-0 h-full rounded-full transition-all duration-500"
+                style={{ width: barWidth(), background: barColor(props.hop.rtt), opacity: '0.75' }}
+              />
+            </div>
+          </Match>
+          <Match when={!props.hop.success}>
             <div class="h-[3px] w-full rounded-full" style={{ background: 'repeating-linear-gradient(90deg, #e4e4e7 0px, #e4e4e7 4px, transparent 4px, transparent 8px)' }} />
-          }
-        >
-          {/* Track (full width, faint) */}
-          <div class="relative w-full h-[6px] rounded-full overflow-hidden" style={{ background: '#f0f0ef' }}>
-            {/* Bar */}
-            <div
-              class="absolute left-0 top-0 h-full rounded-full transition-all duration-500"
-              style={{
-                width: barWidth(),
-                background: barColor(props.hop.rtt),
-                opacity: '0.75',
-              }}
-            />
-          </div>
-        </Show>
+          </Match>
+        </Switch>
       </div>
 
       {/* RTT value */}
       <div class="flex items-center justify-end">
-        <Show
-          when={props.hop.success}
-          fallback={<span class="font-mono text-xs text-ink-disabled">—</span>}
-        >
-          <span class={`font-mono text-sm tabular-nums ${rttTextColor(props.hop.rtt)}`}>
-            {formatRtt(props.hop.rtt)}
-          </span>
-        </Show>
+        <Switch>
+          <Match when={props.hop.isPending}>
+            <div class="skeleton h-3 w-12 rounded" />
+          </Match>
+          <Match when={props.hop.success}>
+            <span class={`font-mono text-sm tabular-nums ${rttTextColor(props.hop.rtt)}`}>
+              {formatRtt(props.hop.rtt)}
+            </span>
+          </Match>
+          <Match when={!props.hop.success}>
+            <span class="font-mono text-xs text-ink-disabled">—</span>
+          </Match>
+        </Switch>
       </div>
     </div>
   );

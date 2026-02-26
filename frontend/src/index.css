@@ -52,6 +52,18 @@
   animation: pulseDot 1.2s ease-in-out infinite;
 }
 
+@keyframes shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+.skeleton {
+  background: linear-gradient(90deg, #f0f0ef 25%, #e8e8e6 50%, #f0f0ef 75%);
+  background-size: 800px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+  border-radius: 4px;
+}
+
 /* Wails titlebar drag region */
 [data-wails-drag] {
   -webkit-app-region: drag;

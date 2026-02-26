@@ -86,14 +86,25 @@ const App: Component = () => {
       offHop = window.runtime.EventsOn('hop', (data: unknown) => {
         const hop = data as HopData;
         setHopMap((prev) => {
-          const next = new Map(prev).set(hop.ttl, hop);
-          // If this is the final hop, remove any stray hops beyond it
-          // (can happen in the rare race where a higher TTL arrived first)
+          const next = new Map(prev);
+
+          // When the final destination TTL becomes known, pre-fill every
+          // slot that hasn't arrived yet with a pending skeleton row so the
+          // user sees the complete path structure immediately.
           if (hop.isFinal) {
-            for (const ttl of next.keys()) {
-              if (ttl > hop.ttl) next.delete(ttl);
+            for (let t = 1; t < hop.ttl; t++) {
+              if (!next.has(t)) {
+                next.set(t, { ttl: t, ip: '', hostname: '', rtt: 0, success: false, isFinal: false, isTimeout: false, isPending: true });
+              }
+            }
+            // Remove any stray rows beyond the destination
+            for (const t of next.keys()) {
+              if (t > hop.ttl) next.delete(t);
             }
           }
+
+          // Real result replaces any pending placeholder
+          next.set(hop.ttl, hop);
           return next;
         });
       });
