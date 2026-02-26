@@ -92,6 +92,11 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 	var lowestFinalTTL atomic.Int32
 	lowestFinalTTL.Store(int32(opts.MaxHops + 1))
 
+	// finalHops collects one Hop per TTL that reached the destination.
+	// After wg.Wait() we pick the one with the lowest TTL and emit it.
+	var finalMu sync.Mutex
+	finalHops := map[int]Hop{}
+
 	var wg sync.WaitGroup
 
 	for ttl := 1; ttl <= opts.MaxHops; ttl++ {
@@ -130,20 +135,25 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 				hop = Hop{TTL: ttl, Success: false, IsTimeout: true}
 			}
 
-			// If this hop reached the destination, try to record the lowest TTL.
+			// Reached the destination: stash it and update lowestFinalTTL.
+			// Do NOT emit yet — we wait until wg.Wait() to pick the true lowest.
 			if hop.Success && (hop.IsFinal || destIPs[hop.IP]) {
 				for {
 					cur := lowestFinalTTL.Load()
 					if int32(ttl) >= cur {
-						break // another goroutine already has a lower or equal TTL
+						break
 					}
 					if lowestFinalTTL.CompareAndSwap(cur, int32(ttl)) {
 						break
 					}
 				}
+				finalMu.Lock()
+				finalHops[ttl] = hop
+				finalMu.Unlock()
+				return // do not emit yet
 			}
 
-			// Discard if a lower TTL already claimed the destination.
+			// Non-final hop: discard if a lower TTL already claimed the destination.
 			if int32(ttl) > lowestFinalTTL.Load() {
 				return
 			}
@@ -155,9 +165,6 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 				}
 			}
 
-			// Set isFinal correctly: only true for the confirmed lowest TTL.
-			hop.IsFinal = (int32(ttl) == lowestFinalTTL.Load() && hop.Success && (hop.IsFinal || destIPs[hop.IP]))
-
 			select {
 			case hops <- hop:
 			case <-ctx.Done():
@@ -166,6 +173,21 @@ func runParallel(ctx context.Context, dest string, opts *Options, hops chan<- Ho
 	}
 
 	wg.Wait()
+
+	// Emit the single destination hop with the lowest TTL.
+	if best, ok := finalHops[int(lowestFinalTTL.Load())]; ok {
+		best.IsFinal = true
+		// Async reverse-DNS for the destination hop.
+		if best.Hostname == "" && best.IP != "" {
+			if names, err := net.LookupAddr(best.IP); err == nil && len(names) > 0 {
+				best.Hostname = strings.TrimSuffix(names[0], ".")
+			}
+		}
+		select {
+		case hops <- best:
+		case <-ctx.Done():
+		}
+	}
 
 	if ctx.Err() != nil {
 		return nil
