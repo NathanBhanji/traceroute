@@ -7,10 +7,12 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  release-macos:
-    name: Build, sign, notarize & release (macOS universal)
+  # ── Job 1: Build, sign, and submit to Apple Notarization ─────────────────────
+  build-and-submit:
+    name: Build, sign & submit for notarization
     runs-on: macos-latest
 
     steps:
@@ -34,7 +36,7 @@ jobs:
         run: npm ci
         working-directory: frontend
 
-      # ── Import Developer ID certificate from GitHub secret ──────────────────
+      # ── Import Developer ID certificate ──────────────────────────────────────
       - name: Import signing certificate
         env:
           CERTIFICATE_P12_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_P12_BASE64 }}
@@ -58,7 +60,7 @@ jobs:
             -S apple-tool:,apple: \
             -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-      # ── Build universal binary (arm64 + amd64) ──────────────────────────────
+      # ── Build universal binary ────────────────────────────────────────────────
       - name: Build Wails app (universal)
         run: |
           wails build \
@@ -66,17 +68,12 @@ jobs:
             --clean \
             -ldflags "-s -w"
 
-      # ── Sign the .app ────────────────────────────────────────────────────────
-      # Sign inner binaries first, then the .app bundle itself.
-      # --deep is intentionally avoided: Apple's notarization rejects it.
+      # ── Sign the .app (inside-out) ────────────────────────────────────────────
       - name: Sign .app
         env:
           DEVELOPER_ID: ${{ secrets.DEVELOPER_ID_APPLICATION_IDENTITY }}
         run: |
           APP="build/bin/Traceroute.app"
-
-          # Sign nested .app bundles first (inside-out), then loose binaries,
-          # then the outer bundle. This is the correct order for notarization.
 
           # 1. Sign nested .app bundles (e.g. WebKit helpers) inside-out
           find "$APP" -name "*.app" -mindepth 1 | sort -r | while read nested; do
@@ -86,7 +83,7 @@ jobs:
               "$nested"
           done
 
-          # 2. Sign loose dylibs and executables not inside a nested .app
+          # 2. Sign loose dylibs
           find "$APP" -type f \( -name "*.dylib" -o -name "*.so" \) | while read f; do
             codesign --force --options runtime \
               --sign "$DEVELOPER_ID" \
@@ -99,10 +96,9 @@ jobs:
             --entitlements build/darwin/entitlements.plist \
             "$APP"
 
-          # Verify
           codesign --verify --deep --strict --verbose=2 "$APP"
 
-      # ── Package as .dmg via hdiutil ─────────────────────────────────────────
+      # ── Create DMG ────────────────────────────────────────────────────────────
       - name: Create DMG
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
@@ -115,14 +111,13 @@ jobs:
           echo "DMG_NAME=${DMG_NAME}" >> "$GITHUB_ENV"
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
-      # ── Notarize the DMG ─────────────────────────────────────────────────────
-      - name: Notarize DMG
+      # ── Submit to Apple Notarization (no waiting) ─────────────────────────────
+      - name: Submit for notarization
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          # Submit (no --wait) and capture the submission ID
           SUBMISSION=$(xcrun notarytool submit "build/bin/${DMG_NAME}" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_PASSWORD" \
@@ -132,72 +127,15 @@ jobs:
           ID=$(echo "$SUBMISSION" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
           echo "Submission ID: $ID"
 
-          # Poll until Accepted/Invalid/Rejected — no timeout, Apple can be slow
-          while true; do
-            sleep 60
-            INFO=$(xcrun notarytool info "$ID" \
-              --apple-id "$APPLE_ID" \
-              --password "$APPLE_APP_PASSWORD" \
-              --team-id "$APPLE_TEAM_ID" \
-              --output-format json)
-            STATUS=$(echo "$INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
-            echo "Status: $STATUS"
-            if [ "$STATUS" = "Accepted" ]; then
-              break
-            elif [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
-              echo "Notarization failed: $STATUS"
-              xcrun notarytool log "$ID" \
-                --apple-id "$APPLE_ID" \
-                --password "$APPLE_APP_PASSWORD" \
-                --team-id "$APPLE_TEAM_ID" || true
-              exit 1
-            fi
-          done
+          # Write metadata for the staple-and-release job to pick up
+          echo "{\"id\":\"$ID\",\"dmg\":\"${DMG_NAME}\",\"tag\":\"${GITHUB_REF_NAME}\"}" > build/bin/submission.json
 
-          xcrun stapler staple "build/bin/${DMG_NAME}"
-
-      # ── Also produce a .tar.gz of the .app for Homebrew cask ────────────────
-      - name: Create tar.gz for Homebrew
-        run: |
-          TARBALL_NAME="Traceroute-${VERSION}-macOS-universal.tar.gz"
-          tar -czf "build/bin/${TARBALL_NAME}" \
-            -C build/bin Traceroute.app
-          echo "TARBALL_NAME=${TARBALL_NAME}" >> "$GITHUB_ENV"
-
-          SHA256=$(shasum -a 256 "build/bin/${TARBALL_NAME}" | awk '{print $1}')
-          echo "TARBALL_SHA256=${SHA256}" >> "$GITHUB_ENV"
-
-      # ── Publish GitHub Release ───────────────────────────────────────────────
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      # ── Upload artifacts for Job 2 ────────────────────────────────────────────
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
         with:
-          name: "Traceroute ${{ env.VERSION }}"
-          body: |
-            ## Install via Homebrew
-
-            ```sh
-            brew tap NathanBhanji/tap
-            brew install --cask nathanbhanji/tap/traceroute
-            ```
-
-            Or download the DMG below and drag Traceroute.app to /Applications.
-          files: |
+          name: release-assets
+          path: |
             build/bin/${{ env.DMG_NAME }}
-            build/bin/${{ env.TARBALL_NAME }}
-          draft: false
-          prerelease: ${{ contains(github.ref_name, '-') }}
-
-      # ── Trigger Homebrew tap update ──────────────────────────────────────────
-      - name: Dispatch tap update
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.TAP_DISPATCH_TOKEN }}
-          repository: NathanBhanji/homebrew-tap
-          event-type: new-release
-          client-payload: |
-            {
-              "version": "${{ env.VERSION }}",
-              "tarball_name": "${{ env.TARBALL_NAME }}",
-              "sha256": "${{ env.TARBALL_SHA256 }}",
-              "download_url": "https://github.com/NathanBhanji/traceroute/releases/download/${{ github.ref_name }}/${{ env.TARBALL_NAME }}"
-            }
+            build/bin/submission.json
+          retention-days: 7

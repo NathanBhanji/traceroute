@@ -1,0 +1,199 @@
+name: Staple & Release
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # poll every 30 minutes
+  workflow_dispatch:           # manual trigger as escape hatch
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  staple-and-release:
+    name: Staple notarization ticket & publish release
+    runs-on: macos-latest
+
+    steps:
+      # ── Find the most recent release-assets artifact ──────────────────────────
+      - name: Find pending release artifact
+        id: find-artifact
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Get the most recent artifact named release-assets
+          ARTIFACT=$(gh api repos/${{ github.repository }}/actions/artifacts \
+            --paginate \
+            --jq '[.artifacts[] | select(.name == "release-assets" and .expired == false)] | sort_by(.created_at) | last')
+
+          if [ -z "$ARTIFACT" ] || [ "$ARTIFACT" = "null" ]; then
+            echo "No pending release-assets artifact found — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          ARTIFACT_ID=$(echo "$ARTIFACT" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+          echo "artifact_id=${ARTIFACT_ID}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Found artifact ID: $ARTIFACT_ID"
+
+      - name: Download release assets
+        if: steps.find-artifact.outputs.skip == 'false'
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.find-artifact.outputs.artifact_id }}
+          path: release-assets
+        continue-on-error: true
+
+      # download-artifact uses run-id not artifact-id — fetch DMG via API instead
+      - name: Download artifact via API
+        if: steps.find-artifact.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          gh api repos/${{ github.repository }}/actions/artifacts/${{ steps.find-artifact.outputs.artifact_id }}/zip \
+            > release-assets.zip
+          unzip -o release-assets.zip -d release-assets
+
+      # ── Read submission metadata ──────────────────────────────────────────────
+      - name: Read submission info
+        if: steps.find-artifact.outputs.skip == 'false'
+        id: submission
+        run: |
+          cat release-assets/submission.json
+          ID=$(python3 -c "import json; d=json.load(open('release-assets/submission.json')); print(d['id'])")
+          DMG=$(python3 -c "import json; d=json.load(open('release-assets/submission.json')); print(d['dmg'])")
+          TAG=$(python3 -c "import json; d=json.load(open('release-assets/submission.json')); print(d['tag'])")
+          echo "id=${ID}" >> "$GITHUB_OUTPUT"
+          echo "dmg=${DMG}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      # ── Check if already released (idempotency) ───────────────────────────────
+      - name: Check if already released
+        if: steps.find-artifact.outputs.skip == 'false'
+        id: check-release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.submission.outputs.tag }}"
+          EXISTS=$(gh release view "$TAG" -R ${{ github.repository }} 2>/dev/null && echo "true" || echo "false")
+          echo "exists=${EXISTS}" >> "$GITHUB_OUTPUT"
+          if [ "$EXISTS" = "true" ]; then
+            echo "Release $TAG already exists — cleaning up artifact and exiting."
+          fi
+
+      # ── Delete artifact if already released ───────────────────────────────────
+      - name: Delete artifact (already released)
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method DELETE \
+            repos/${{ github.repository }}/actions/artifacts/${{ steps.find-artifact.outputs.artifact_id }}
+
+      # ── Check notarization status ─────────────────────────────────────────────
+      - name: Check notarization status
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false'
+        id: notarize-status
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          ID="${{ steps.submission.outputs.id }}"
+          INFO=$(xcrun notarytool info "$ID" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --output-format json)
+          echo "$INFO"
+          STATUS=$(echo "$INFO" | python3 -c "import sys,json; print(json.load(sys.stdin).get('status',''))")
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "Notarization status: $STATUS"
+
+          if [ "$STATUS" = "Invalid" ] || [ "$STATUS" = "Rejected" ]; then
+            echo "Notarization failed — fetching Apple log:"
+            xcrun notarytool log "$ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
+
+          if [ "$STATUS" = "In Progress" ]; then
+            echo "Still in progress — will retry at next cron tick."
+          fi
+
+      # ── Staple & ship (only if Accepted) ─────────────────────────────────────
+      - name: Staple notarization ticket
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false' && steps.notarize-status.outputs.status == 'Accepted'
+        run: |
+          xcrun stapler staple "release-assets/${{ steps.submission.outputs.dmg }}"
+
+      - name: Create tar.gz for Homebrew
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false' && steps.notarize-status.outputs.status == 'Accepted'
+        run: |
+          TAG="${{ steps.submission.outputs.tag }}"
+          VERSION="${TAG#v}"
+          DMG="${{ steps.submission.outputs.dmg }}"
+          TARBALL_NAME="Traceroute-${VERSION}-macOS-universal.tar.gz"
+
+          # Extract .app from DMG to create tarball
+          hdiutil attach "release-assets/${DMG}" -mountpoint /Volumes/TracerouteDMG -quiet
+          tar -czf "release-assets/${TARBALL_NAME}" -C /Volumes/TracerouteDMG Traceroute.app
+          hdiutil detach /Volumes/TracerouteDMG -quiet
+
+          SHA256=$(shasum -a 256 "release-assets/${TARBALL_NAME}" | awk '{print $1}')
+          echo "TARBALL_NAME=${TARBALL_NAME}" >> "$GITHUB_ENV"
+          echo "TARBALL_SHA256=${SHA256}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false' && steps.notarize-status.outputs.status == 'Accepted'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.submission.outputs.tag }}
+          name: "Traceroute ${{ env.VERSION }}"
+          body: |
+            ## Install via Homebrew
+
+            ```sh
+            brew tap NathanBhanji/tap
+            brew install --cask nathanbhanji/tap/traceroute
+            ```
+
+            Or download the DMG below and drag Traceroute.app to /Applications.
+          files: |
+            release-assets/${{ steps.submission.outputs.dmg }}
+            release-assets/${{ env.TARBALL_NAME }}
+          draft: false
+          prerelease: ${{ contains(steps.submission.outputs.tag, '-') }}
+
+      - name: Dispatch Homebrew tap update
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false' && steps.notarize-status.outputs.status == 'Accepted'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          repository: NathanBhanji/homebrew-tap
+          event-type: new-release
+          client-payload: |
+            {
+              "version": "${{ env.VERSION }}",
+              "tarball_name": "${{ env.TARBALL_NAME }}",
+              "sha256": "${{ env.TARBALL_SHA256 }}",
+              "download_url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.submission.outputs.tag }}/${{ env.TARBALL_NAME }}"
+            }
+
+      # ── Clean up artifact once shipped ────────────────────────────────────────
+      - name: Delete artifact (shipped)
+        if: steps.find-artifact.outputs.skip == 'false' && steps.check-release.outputs.exists == 'false' && steps.notarize-status.outputs.status == 'Accepted'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method DELETE \
+            repos/${{ github.repository }}/actions/artifacts/${{ steps.find-artifact.outputs.artifact_id }}
+          echo "Release ${{ steps.submission.outputs.tag }} shipped and artifact cleaned up."
